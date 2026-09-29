@@ -532,6 +532,123 @@ def test_sliding_window_possible_cached_prefix():
     )
 
 
+def _sliding_window_expected_hit_blocks(
+    block_is_cached: list[bool],
+    num_needed: int,
+    block_size: int,
+    alignment_tokens: int,
+    drop_eagle_block: bool,
+) -> int:
+    """Brute-force reference for SlidingWindowManager.find_longest_cache_hit.
+
+    Returns the number of blocks in the expected hit."""
+
+    def is_aligned_end(i: int) -> bool:
+        post_pop_blocks = i if drop_eagle_block else i + 1
+        return (post_pop_blocks * block_size) % alignment_tokens == 0
+
+    num_needed = max(num_needed, 1)
+    n = len(block_is_cached)
+    num_blocks = 0
+    # The rightmost aligned window of `num_needed` cached blocks.
+    for end in range(n - 1, num_needed - 2, -1):
+        if is_aligned_end(end) and all(block_is_cached[end - num_needed + 1 : end + 1]):
+            num_blocks = end + 1
+            break
+    else:
+        # Otherwise, the longest aligned all-cached prefix.
+        for end in range(n - 1, -1, -1):
+            if is_aligned_end(end) and all(block_is_cached[: end + 1]):
+                num_blocks = end + 1
+                break
+        while num_blocks * block_size % alignment_tokens != 0:
+            num_blocks -= 1
+    if drop_eagle_block and num_blocks > 0:
+        num_blocks -= 1
+    while num_blocks * block_size % alignment_tokens != 0:
+        num_blocks -= 1
+    return num_blocks
+
+
+@pytest.mark.parametrize("drop_eagle_block", [False, True])
+@pytest.mark.parametrize("alignment_multiple", [1, 3])
+@pytest.mark.parametrize("hit_prob", [0.1, 0.5, 0.9])
+def test_sliding_window_cache_hit_random(
+    drop_eagle_block: bool, alignment_multiple: int, hit_prob: float
+):
+    """find_longest_cache_hit matches a brute-force search, and a miss-heavy
+    search skips blocks instead of looking up every one."""
+    rng = random.Random(0)
+    block_size = 2
+    alignment_tokens = block_size * alignment_multiple
+    for _ in range(300):
+        block_pool = BlockPool(
+            num_gpu_blocks=100, enable_caching=True, hash_block_size=block_size
+        )
+        num_lookups = 0
+        get_cached_block = block_pool.get_cached_block
+
+        def counting_get_cached_block(*args, get_cached_block=get_cached_block):
+            nonlocal num_lookups
+            num_lookups += 1
+            return get_cached_block(*args)
+
+        block_pool.get_cached_block = counting_get_cached_block  # type: ignore[method-assign]
+        sliding_window = rng.randint(1, 20)
+        spec = SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=sliding_window,
+        )
+        block_is_cached = [rng.random() < hit_prob for _ in range(rng.randint(0, 60))]
+        block_hashes = [BlockHash(str(i).encode()) for i in range(len(block_is_cached))]
+        for i, is_cached in enumerate(block_is_cached):
+            if is_cached:
+                block_pool.cached_block_hash_to_block.insert(
+                    make_block_hash_with_group_id(block_hashes[i], 0),
+                    block_pool.blocks[i + 1],
+                )
+
+        computed_blocks, hit_length = SlidingWindowManager.find_longest_cache_hit(
+            block_hashes=block_hashes,
+            max_length=len(block_hashes) * block_size,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=alignment_tokens,
+        )
+
+        num_needed = SlidingWindowManager._contiguous_blocks_for_hit(
+            sliding_window, block_size, drop_eagle_block
+        )
+        expected = _sliding_window_expected_hit_blocks(
+            block_is_cached,
+            num_needed,
+            block_size,
+            alignment_tokens,
+            drop_eagle_block,
+        )
+        assert hit_length == expected * block_size
+        blocks = computed_blocks[0]
+        assert len(blocks) == expected
+        for i, block in enumerate(blocks):
+            assert block == block_pool.null_block or block == block_pool.blocks[i + 1]
+        # The blocks the window needs are real cached blocks.
+        num_window_blocks = min(expected, max(num_needed - drop_eagle_block, 0))
+        assert all(
+            block != block_pool.null_block
+            for block in blocks[expected - num_window_blocks :]
+        )
+        # Every block is looked up at most once.
+        assert num_lookups <= len(block_is_cached)
+        if not any(block_is_cached):
+            # A miss rules out a whole window, so misses are skipped over.
+            assert num_lookups <= len(block_is_cached) // max(num_needed, 1) + 1
+
+
 def test_sliding_window_cache_hit_with_finer_hash_alignment():
     """Sliding-window lookup uses full blocks with finer hybrid-cache hashes."""
     hash_block_size = 2

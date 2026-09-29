@@ -999,49 +999,92 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
         )
 
-        # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
-        # optimize the time complexity from O(max_num_blocks) to
-        # O(max_num_blocks / sliding_window_contiguous_blocks +
-        # sliding_window_contiguous_blocks),
-        # which is good for low cache hit rate scenarios.
+        # A hit of at least one block is needed to end a match.
+        num_needed = max(sliding_window_contiguous_blocks, 1)
         max_num_blocks = max_length // kv_cache_spec.block_size
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [block_pool.null_block] * max_num_blocks
             for _ in range(len(kv_cache_group_ids))
         )
         block_size = kv_cache_spec.block_size
-        num_contiguous_blocks = 0
-        match_found = False
-        # Search from right to left and early stop when a match is found.
-        for i in range(max_num_blocks - 1, -1, -1):
+
+        def is_aligned_end(i: int) -> bool:
+            # Whether a match may end at block `i` given `alignment_tokens`.
+            if block_size == alignment_tokens:  # Faster for common case.
+                return True
+            post_pop_blocks = i if drop_eagle_block else i + 1
+            return (post_pop_blocks * block_size) % alignment_tokens == 0
+
+        def lookup(i: int) -> bool:
             if cached_block := block_pool.get_cached_block(
                 block_hashes[i], kv_cache_group_ids
             ):
-                # Skip prefix matching check if the block is not aligned with
-                # `alignment_tokens`.
-                if num_contiguous_blocks == 0 and block_size != alignment_tokens:
-                    post_pop_blocks = i if drop_eagle_block else i + 1
-                    if (post_pop_blocks * block_size) % alignment_tokens != 0:
-                        continue
-                # Add the cached block to the computed blocks.
                 for computed, cached in zip(computed_blocks, cached_block):
                     computed[i] = cached
-                num_contiguous_blocks += 1
-                if num_contiguous_blocks >= sliding_window_contiguous_blocks:
-                    # Trim the trailing blocks.
-                    # E.g., [NULL, NULL, 8, 3, NULL, 9] -> [NULL, NULL, 8, 3]
-                    # when sliding_window_contiguous_blocks=2.
-                    for computed in computed_blocks:
-                        del computed[i + num_contiguous_blocks :]
-                    match_found = True
+                return True
+            return False
+
+        # Find the rightmost window of `num_needed` cached blocks ending at an
+        # aligned block. Each window is checked from its left end, so a miss at
+        # block i rules out every window containing i and the search skips
+        # ahead to windows ending before i without looking at the blocks right
+        # of i. Blocks in [verified_start, verified_end) are known cache hits.
+        # This makes a miss-heavy search O(max_num_blocks / num_needed) lookups
+        # instead of O(max_num_blocks), and each block is looked up at most
+        # once.
+        verified_start = verified_end = max_num_blocks
+        end = max_num_blocks - 1
+        # The leftmost block known to be a cache miss.
+        first_miss = max_num_blocks
+        match_found = False
+        while True:
+            while end >= 0 and not is_aligned_end(end):
+                end -= 1
+            start = end - num_needed + 1
+            if start < 0:
+                break
+            i = start
+            while i <= end:
+                if verified_start <= i < verified_end:
+                    i = verified_end
+                    continue
+                cached_block = block_pool.get_cached_block(
+                    block_hashes[i], kv_cache_group_ids
+                )
+                if not cached_block:
                     break
-            else:
-                num_contiguous_blocks = 0
+                for computed, cached in zip(computed_blocks, cached_block):
+                    computed[i] = cached
+                i += 1
+            if i > end:
+                # Trim the trailing blocks.
+                # E.g., [NULL, NULL, 8, 3, NULL, 9] -> [NULL, NULL, 8, 3]
+                # when sliding_window_contiguous_blocks=2.
+                for computed in computed_blocks:
+                    del computed[end + 1 :]
+                match_found = True
+                break
+            verified_start, verified_end = start, i
+            # Misses are found in decreasing order.
+            first_miss = i
+            end = i - 1
         if not match_found:
-            # The first `num_contiguous_blocks` is a cache hit even if
-            # `num_contiguous_blocks < sliding_window_contiguous_blocks`.
+            # The cached run starting at the first block is a cache hit even
+            # if it is shorter than `sliding_window_contiguous_blocks`. No
+            # aligned end at or after `num_needed - 1` can be inside that run,
+            # otherwise a match would have been found.
+            num_prefix_blocks = 0
+            limit = min(first_miss, num_needed - 1)
+            while num_prefix_blocks < limit and (
+                computed_blocks[0][num_prefix_blocks] is not block_pool.null_block
+                or lookup(num_prefix_blocks)
+            ):
+                num_prefix_blocks += 1
+            end = num_prefix_blocks - 1
+            while end >= 0 and not is_aligned_end(end):
+                end -= 1
             for computed in computed_blocks:
-                del computed[num_contiguous_blocks:]
+                del computed[end + 1 :]
             while (
                 block_size != alignment_tokens  # Faster for common case.
                 and len(computed_blocks[0]) * block_size % alignment_tokens != 0
