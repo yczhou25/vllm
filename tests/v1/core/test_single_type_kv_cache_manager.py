@@ -561,13 +561,48 @@ def _sliding_window_expected_hit_blocks(
             if is_aligned_end(end) and all(block_is_cached[: end + 1]):
                 num_blocks = end + 1
                 break
-        while num_blocks * block_size % alignment_tokens != 0:
-            num_blocks -= 1
     if drop_eagle_block and num_blocks > 0:
         num_blocks -= 1
     while num_blocks * block_size % alignment_tokens != 0:
         num_blocks -= 1
     return num_blocks
+
+
+def test_sliding_window_eagle_prefix_hit_keeps_alignment_unit():
+    """An aligned short prefix must keep its last unit after EAGLE is dropped."""
+    block_size = 2
+    alignment_tokens = 6
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=20,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=block_size
+    )
+    block_is_cached = [True] * 11 + [False]
+    block_hashes = [BlockHash(str(i).encode()) for i in range(len(block_is_cached))]
+    for i, is_cached in enumerate(block_is_cached):
+        if is_cached:
+            block_pool.cached_block_hash_to_block.insert(
+                make_block_hash_with_group_id(block_hashes[i], 0),
+                block_pool.blocks[i + 1],
+            )
+
+    computed_blocks, hit_length = SlidingWindowManager.find_longest_cache_hit(
+        block_hashes=block_hashes,
+        max_length=len(block_hashes) * block_size,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=sliding_window_spec,
+        drop_eagle_block=True,
+        alignment_tokens=alignment_tokens,
+    )
+
+    assert hit_length == 18
+    assert computed_blocks[0] == block_pool.blocks[1:10]
 
 
 @pytest.mark.parametrize("drop_eagle_block", [False, True])

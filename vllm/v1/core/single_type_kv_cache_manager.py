@@ -1085,12 +1085,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 end -= 1
             for computed in computed_blocks:
                 del computed[end + 1 :]
-            while (
-                block_size != alignment_tokens  # Faster for common case.
-                and len(computed_blocks[0]) * block_size % alignment_tokens != 0
-            ):
-                for computed in computed_blocks:
-                    computed.pop()
         if drop_eagle_block and computed_blocks[0]:
             for computed in computed_blocks:
                 computed.pop()
